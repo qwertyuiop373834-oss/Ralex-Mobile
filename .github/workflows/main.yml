@@ -1,0 +1,356 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+
+      - name: Layihe fayllarini yarat
+        run: |
+          mkdir -p app/src/main/java/az/ralex/mobile app/src/main/assets
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "RalexMobile"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "az.ralex.mobile"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "az.ralex.mobile"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              androidResources { noCompress += "tflite" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("org.tensorflow:tensorflow-lite:2.14.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Ralex Mobile"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/az/ralex/mobile/MainActivity.kt <<'EOF'
+          package az.ralex.mobile
+
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.launch
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+              private var videoUri: Uri? = null
+              private lateinit var status: TextView
+              private lateinit var progress: ProgressBar
+              private lateinit var startBtn: Button
+
+              private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  videoUri = uri
+                  startBtn.isEnabled = uri != null
+                  status.text = if (uri != null) "Video seçildi" else "Video seçilmədi"
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "Ralex Mobile"; textSize = 28f; gravity = Gravity.CENTER
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "AI ilə video keyfiyyətini yaxşılaşdır"; gravity = Gravity.CENTER
+                  })
+                  val pick = Button(this).apply { text = "Video seç" }
+                  startBtn = Button(this).apply { text = "Yaxşılaşdır"; isEnabled = false }
+                  progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
+                  status = TextView(this).apply { gravity = Gravity.CENTER; text = "Hazırdır" }
+                  listOf(pick, startBtn, progress, status).forEach { root.addView(it) }
+                  setContentView(root)
+
+                  pick.setOnClickListener { picker.launch("video/*") }
+                  startBtn.setOnClickListener {
+                      val uri = videoUri ?: return@setOnClickListener
+                      val out = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "ralex_${System.currentTimeMillis()}.mp4")
+                      startBtn.isEnabled = false
+                      lifecycleScope.launch {
+                          try {
+                              VideoEnhancer.enhance(this@MainActivity, uri, out) { p ->
+                                  runOnUiThread { progress.progress = p; status.text = "Emal olunur: $p%" }
+                              }
+                              status.text = "Hazırdır!\n${out.absolutePath}"
+                          } catch (e: Exception) {
+                              status.text = "Xəta: ${e.message}"
+                          }
+                          startBtn.isEnabled = true
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/az/ralex/mobile/Upscaler.kt <<'EOF'
+          package az.ralex.mobile
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import org.tensorflow.lite.Interpreter
+          import java.io.FileInputStream
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.nio.channels.FileChannel
+          import kotlin.math.ceil
+
+          class Upscaler(context: Context) {
+              private val interpreter: Interpreter
+              private val inBuf = ByteBuffer.allocateDirect(50 * 50 * 3 * 4).order(ByteOrder.nativeOrder())
+              private val outBuf = ByteBuffer.allocateDirect(200 * 200 * 3 * 4).order(ByteOrder.nativeOrder())
+
+              init {
+                  val fd = context.assets.openFd("esrgan.tflite")
+                  val model = FileInputStream(fd.fileDescriptor).channel
+                      .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+                  interpreter = Interpreter(model, Interpreter.Options().apply { setNumThreads(4) })
+              }
+
+              fun outputSize(w: Int, h: Int) =
+                  Pair(ceil(w / 50.0).toInt() * 200, ceil(h / 50.0).toInt() * 200)
+
+              fun upscale(src: Bitmap): Bitmap {
+                  val cols = ceil(src.width / 50.0).toInt()
+                  val rows = ceil(src.height / 50.0).toInt()
+                  val scaled = Bitmap.createScaledBitmap(src, cols * 50, rows * 50, true)
+                  val out = Bitmap.createBitmap(cols * 200, rows * 200, Bitmap.Config.ARGB_8888)
+                  val inPix = IntArray(50 * 50)
+                  val outPix = IntArray(200 * 200)
+
+                  for (r in 0 until rows) for (c in 0 until cols) {
+                      scaled.getPixels(inPix, 0, 50, c * 50, r * 50, 50, 50)
+                      inBuf.rewind()
+                      for (p in inPix) {
+                          inBuf.putFloat(((p shr 16) and 255).toFloat())
+                          inBuf.putFloat(((p shr 8) and 255).toFloat())
+                          inBuf.putFloat((p and 255).toFloat())
+                      }
+                      inBuf.rewind(); outBuf.rewind()
+                      interpreter.run(inBuf, outBuf)
+                      outBuf.rewind()
+                      for (i in outPix.indices) {
+                          val rr = outBuf.float.coerceIn(0f, 255f).toInt()
+                          val gg = outBuf.float.coerceIn(0f, 255f).toInt()
+                          val bb = outBuf.float.coerceIn(0f, 255f).toInt()
+                          outPix[i] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
+                      }
+                      out.setPixels(outPix, 0, 200, c * 200, r * 200, 200, 200)
+                  }
+                  if (scaled !== src) scaled.recycle()
+                  return out
+              }
+
+              fun close() = interpreter.close()
+          }
+          EOF
+
+          cat > app/src/main/java/az/ralex/mobile/VideoEnhancer.kt <<'EOF'
+          package az.ralex.mobile
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.media.*
+          import android.net.Uri
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.isActive
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.nio.ByteBuffer
+          import kotlin.coroutines.coroutineContext
+
+          object VideoEnhancer {
+              private const val FPS = 24
+              private const val MAX_SIDE = 360
+
+              suspend fun enhance(
+                  context: Context, uri: Uri, outFile: File, onProgress: (Int) -> Unit
+              ) = withContext(Dispatchers.Default) {
+                  val mmr = MediaMetadataRetriever().apply { setDataSource(context, uri) }
+                  val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)!!.toLong()
+                  val first = mmr.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST)
+                      ?: error("Video oxunmadı")
+
+                  val k = minOf(1f, MAX_SIDE / maxOf(first.width, first.height).toFloat())
+                  val tw = (first.width * k).toInt().coerceAtLeast(50)
+                  val th = (first.height * k).toInt().coerceAtLeast(50)
+
+                  val upscaler = Upscaler(context)
+                  val (ow, oh) = upscaler.outputSize(tw, th)
+
+                  val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, ow, oh).apply {
+                      setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                      setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
+                      setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
+                      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                  }
+                  val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                  enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                  val surface = enc.createInputSurface()
+                  enc.start()
+
+                  val audioEx = MediaExtractor().apply { setDataSource(context, uri, null) }
+                  var audioFormat: MediaFormat? = null
+                  for (i in 0 until audioEx.trackCount) {
+                      val f = audioEx.getTrackFormat(i)
+                      if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                          audioEx.selectTrack(i); audioFormat = f; break
+                      }
+                  }
+
+                  val muxer = MediaMuxer(outFile.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                  var vTrack = -1; var aTrack = -1; var started = false
+                  var outCount = 0L
+                  val frameUs = 1_000_000L / FPS
+                  val info = MediaCodec.BufferInfo()
+
+                  fun drain(end: Boolean) {
+                      while (true) {
+                          val idx = enc.dequeueOutputBuffer(info, 10_000)
+                          when {
+                              idx == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!end) return
+                              idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                  vTrack = muxer.addTrack(enc.outputFormat)
+                                  audioFormat?.let { aTrack = muxer.addTrack(it) }
+                                  muxer.start(); started = true
+                              }
+                              idx >= 0 -> {
+                                  val buf = enc.getOutputBuffer(idx)!!
+                                  if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) info.size = 0
+                                  if (info.size > 0 && started) {
+                                      info.presentationTimeUs = outCount++ * frameUs
+                                      muxer.writeSampleData(vTrack, buf, info)
+                                  }
+                                  enc.releaseOutputBuffer(idx, false)
+                                  if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+                              }
+                          }
+                      }
+                  }
+
+                  val total = (durMs * FPS / 1000).toInt().coerceAtLeast(1)
+                  for (i in 0 until total) {
+                      if (!coroutineContext.isActive) break
+                      val raw = mmr.getFrameAtTime(i * 1_000_000L / FPS, MediaMetadataRetriever.OPTION_CLOSEST)
+                          ?: continue
+                      val small = Bitmap.createScaledBitmap(raw, tw, th, true)
+                      val big = upscaler.upscale(small)
+                      val canvas = surface.lockCanvas(null)
+                      canvas.drawBitmap(big, 0f, 0f, null)
+                      surface.unlockCanvasAndPost(canvas)
+                      raw.recycle(); small.recycle(); big.recycle()
+                      drain(false)
+                      onProgress((i + 1) * 100 / total)
+                  }
+                  enc.signalEndOfInputStream()
+                  drain(true)
+
+                  if (started && aTrack >= 0) {
+                      val buf = ByteBuffer.allocate(1 shl 20)
+                      val ai = MediaCodec.BufferInfo()
+                      while (true) {
+                          buf.clear()
+                          val n = audioEx.readSampleData(buf, 0)
+                          if (n < 0) break
+                          ai.set(0, n, audioEx.sampleTime, audioEx.sampleFlags)
+                          muxer.writeSampleData(aTrack, buf, ai)
+                          audioEx.advance()
+                      }
+                  }
+
+                  if (started) muxer.stop()
+                  muxer.release(); enc.stop(); enc.release(); surface.release()
+                  audioEx.release(); mmr.release(); upscaler.close()
+              }
+          }
+          EOF
+
+      - name: AI modelini endir
+        run: |
+          if [ ! -s app/src/main/assets/esrgan.tflite ]; then
+            curl -L -o app/src/main/assets/esrgan.tflite "https://tfhub.dev/captain-pool/lite-model/esrgan-tf2/1?lite-format=tflite" || true
+          fi
+          ls -la app/src/main/assets
+          SIZE=$(stat -c%s app/src/main/assets/esrgan.tflite 2>/dev/null || echo 0)
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "MODEL ENDIRILMEDI. esrgan.tflite faylini elle yukleyin."
+            exit 1
+          fi
+
+      - name: Build
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RalexMobile-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
